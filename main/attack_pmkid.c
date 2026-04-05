@@ -87,6 +87,12 @@ void attack_pmkid_stop(){
     wifictl_sta_disconnect();
     wifictl_sniffer_stop();
     frame_analyzer_capture_stop();
-    ESP_ERROR_CHECK(esp_event_handler_unregister(ESP_EVENT_ANY_BASE, ESP_EVENT_ANY_ID, &pmkid_exit_condition_handler));
+    // ESP_ERROR_CHECK(esp_event_handler_unregister(ESP_EVENT_ANY_BASE, ESP_EVENT_ANY_ID, &pmkid_exit_condition_handler));
+    
+    esp_err_t err = esp_event_handler_unregister(ESP_EVENT_ANY_BASE, ESP_EVENT_ANY_ID, &pmkid_exit_condition_handler);
+    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+        ESP_LOGE(TAG, "Failed to unregister handler: %s", esp_err_to_name(err));
+    }
+    
     ESP_LOGD(TAG, "PMKID attack stopped");
 }

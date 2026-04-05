@@ -77,5 +77,10 @@ void frame_analyzer_capture_start(search_type_t search_type_arg, const uint8_t *
 }
 
 void frame_analyzer_capture_stop(){
-    ESP_ERROR_CHECK(esp_event_handler_unregister(ESP_EVENT_ANY_BASE, ESP_EVENT_ANY_ID, &data_frame_handler));
+    // ESP_ERROR_CHECK(esp_event_handler_unregister(ESP_EVENT_ANY_BASE, ESP_EVENT_ANY_ID, &data_frame_handler));
+    esp_err_t err = esp_event_handler_unregister(ESP_EVENT_ANY_BASE, ESP_EVENT_ANY_ID, &data_frame_handler);
+    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+        ESP_LOGE(TAG, "Failed to unregister handler: %s", esp_err_to_name(err));
+    }
+   
 }
